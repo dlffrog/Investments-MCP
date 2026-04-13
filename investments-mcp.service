@@ -1,0 +1,20 @@
+[Unit]
+Description=Investments MCP Server
+Documentation=https://github.com/YOUR_USERNAME/investments-mcp
+After=network.target
+
+[Service]
+Type=simple
+User=daniel
+Group=daniel
+WorkingDirectory=/var/home/daniel/Documents/investments-mcp
+ExecStart=/usr/bin/python3 -m investments_mcp.server
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=investments-mcp
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

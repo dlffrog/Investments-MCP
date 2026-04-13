@@ -1,0 +1,30 @@
+# investments-mcp configuration template
+# Copy this file to config.local.yaml and fill in your values.
+# config.local.yaml is gitignored — never commit it.
+
+vault:
+  root: "/path/to/your/obsidian/vault"   # e.g. /var/home/daniel/Documents/Investments
+  positions: "Positions"
+  journal: "Journal"
+  templates: "Templates"
+  strategies: "Strategies"
+
+fmp:
+  api_key: "YOUR_FMP_API_KEY_HERE"
+  base_url: "https://financialmodelingprep.com/stable"
+
+openbb:
+  default_provider: "fmp"    # fmp | yfinance
+
+server:
+  host: "0.0.0.0"
+  port: 8765
+  # Generate with: openssl rand -hex 32
+  auth_token: "REPLACE_WITH_A_LONG_RANDOM_STRING"
+
+# FX rates cache — populated automatically on first run, do not edit manually
+fx_rates: {}
+
+alerts:
+  momentum_stop_distance_pct: 5.0
+  thematic_target_proximity_pct: 20
