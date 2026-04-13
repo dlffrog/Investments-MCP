@@ -53,8 +53,15 @@ mcp = FastMCP("investments-vault")
 # ASGI bearer token middleware
 # ---------------------------------------------------------------------------
 
+_LOCALHOST = {"127.0.0.1", "::1", "localhost"}
+
+
 class _BearerAuth:
-    """Pure-ASGI middleware that enforces a shared bearer token."""
+    """
+    ASGI middleware that enforces a shared bearer token for remote clients.
+    Localhost connections (127.0.0.1 / ::1) are trusted without a token,
+    so local Claude Code sessions work without needing --header at registration.
+    """
 
     def __init__(self, app, token: str):
         self._app = app
@@ -62,22 +69,23 @@ class _BearerAuth:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
-            headers = {k.lower(): v for k, v in scope.get("headers", [])}
-            auth = headers.get(b"authorization", b"").decode("utf-8", errors="replace")
-            if auth != self._expected:
-                if scope["type"] == "http":
-                    body = b"Unauthorized"
-                    response_start = {
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [
-                            [b"content-type", b"text/plain"],
-                            [b"content-length", str(len(body)).encode()],
-                        ],
-                    }
-                    await send(response_start)
-                    await send({"type": "http.response.body", "body": body})
-                return
+            client_host = (scope.get("client") or ("", 0))[0]
+            if client_host not in _LOCALHOST:
+                headers = {k.lower(): v for k, v in scope.get("headers", [])}
+                auth = headers.get(b"authorization", b"").decode("utf-8", errors="replace")
+                if auth != self._expected:
+                    if scope["type"] == "http":
+                        body = b"Unauthorized"
+                        await send({
+                            "type": "http.response.start",
+                            "status": 401,
+                            "headers": [
+                                [b"content-type", b"text/plain"],
+                                [b"content-length", str(len(body)).encode()],
+                            ],
+                        })
+                        await send({"type": "http.response.body", "body": body})
+                    return
         await self._app(scope, receive, send)
 
 
