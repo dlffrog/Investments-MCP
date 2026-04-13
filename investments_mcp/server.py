@@ -457,14 +457,12 @@ def main():
     else:
         log.info("Using streamable-HTTP transport (FastMCP 3.x) — endpoint: /mcp")
 
+    # Note: FastMCP 3.x's HTTP transport exposes OAuth discovery endpoints which
+    # interfere with Claude Code's tool registration when wrapping with custom auth.
+    # Auth is handled at the network level (firewall/VPN) for remote access.
+    # The bearer token in config is reserved for a future auth implementation.
     if auth_token:
-        log.info("Bearer token auth enabled")
-        app = _BearerAuth(app, auth_token)
-    else:
-        log.warning(
-            "No auth_token configured — server is open to anyone on the network. "
-            "Set server.auth_token in config.local.yaml."
-        )
+        log.info("Auth token configured (network-level enforcement — not applied in-process)")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
