@@ -1,20 +1,21 @@
 """
 server.py — FastMCP server exposing 12 investment vault tools.
 
-Transport: SSE (Server-Sent Events) — accessible over a network.
+Transport: Streamable HTTP (FastMCP 3.x) — accessible over a network.
 Auth:      Bearer token checked via ASGI middleware.
+Endpoint:  http://host:port/mcp
 
 Run:
     python3 -m investments_mcp.server
 
 Register in Claude Code (local):
-    claude mcp add investments-vault --transport sse http://localhost:8765/sse
+    claude mcp add investments-vault --transport http http://localhost:8765/mcp
 
 Register from another machine:
     claude mcp add investments-vault \\
-      --transport sse \\
+      --transport http \\
       --header "Authorization: Bearer <your_token>" \\
-      http://192.168.x.x:8765/sse
+      http://192.168.x.x:8765/mcp
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ import uvicorn
 from fastmcp import FastMCP
 
 from .config import load_config
-from .prices import get_equity_quote, get_fx_rate, get_historical_ohlcv, get_all_fx_rates, save_fx_cache
+from .prices import get_equity_quote, get_fx_rate, get_historical_ohlcv, get_all_fx_rates
+from .config import save_fx_cache
 from .trade_ops import (
     close_position as _close_position,
     open_position as _open_position,
@@ -429,20 +431,23 @@ def main():
 
     log.info("Starting investments-mcp on %s:%d", host, port)
 
-    # Get the FastMCP SSE ASGI app
-    # FastMCP 2.x exposes sse_app() for SSE transport
+    # Get the FastMCP ASGI app.
+    # FastMCP 3.x uses streamable-HTTP via http_app() → endpoint /mcp
     try:
-        app = mcp.sse_app()
+        app = mcp.http_app()
     except AttributeError:
-        # Fallback for different FastMCP 2.x versions
+        # FastMCP 2.x fallback
         try:
-            app = mcp.get_asgi_app()
+            app = mcp.sse_app()
+            log.info("Using SSE transport (FastMCP 2.x) — endpoint: /sse")
         except AttributeError:
             log.error(
                 "Could not get FastMCP ASGI app. "
                 "Ensure fastmcp>=2.0.0 is installed: pip install 'fastmcp>=2.0.0'"
             )
             sys.exit(1)
+    else:
+        log.info("Using streamable-HTTP transport (FastMCP 3.x) — endpoint: /mcp")
 
     if auth_token:
         log.info("Bearer token auth enabled")

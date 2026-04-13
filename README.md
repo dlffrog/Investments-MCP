@@ -58,15 +58,15 @@ python3 -m investments_mcp.server
 
 On the **host machine**:
 ```bash
-claude mcp add investments-vault --transport sse http://localhost:8765/sse
+claude mcp add investments-vault --transport http http://localhost:8765/mcp
 ```
 
 From a **remote machine** (replace IP and token):
 ```bash
 claude mcp add investments-vault \
-  --transport sse \
+  --transport http \
   --header "Authorization: Bearer YOUR_TOKEN" \
-  http://192.168.x.x:8765/sse
+  http://192.168.x.x:8765/mcp
 ```
 
 ### 5. Run as a system service (optional)
