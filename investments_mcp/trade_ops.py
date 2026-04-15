@@ -23,7 +23,8 @@ from pathlib import Path
 import frontmatter as fm
 
 from .config import load_config, save_fx_cache
-from .prices import get_fx_rate, get_equity_quote, get_all_fx_rates
+from .prices import get_fx_rate, get_equity_quote, get_all_fx_rates, resolve_ticker as _resolve_symbol
+from .exchanges import build_eodhd_symbol, build_yahoo_symbol, VAULT_TO_EODHD
 from .vault import (
     resolve_ticker,
     load_position,
@@ -71,23 +72,16 @@ def _get_watchlist_path(cfg: dict) -> Path:
     return vault_root / "_Watchlist.md"
 
 
-def _fmp_key(cfg: dict) -> str | None:
-    return cfg.get("fmp", {}).get("api_key")
-
-
-def _default_provider(cfg: dict) -> str:
-    return cfg.get("openbb", {}).get("default_provider", "fmp")
+def _eodhd_key(cfg: dict) -> str | None:
+    return cfg.get("eodhd", {}).get("api_key")
 
 
 def _live_fx_rate(currency: str, cfg: dict) -> float:
-    """Fetch live FX rate, falling back to cached config values."""
-    fallback = cfg.get("fx_rates", {})
-    provider = _default_provider(cfg)
+    """Fetch live FX rate via EODHD, falling back to cached config values."""
     return get_fx_rate(
         currency,
-        provider=provider,
-        fallback_rates=fallback,
-        fmp_api_key=_fmp_key(cfg),
+        api_key=_eodhd_key(cfg),
+        fallback_rates=cfg.get("fx_rates", {}),
     )
 
 
@@ -245,7 +239,7 @@ def open_position(
     entry_date: str,
     currency: str,
     sector: str,
-    yahoo_ticker: str = "",
+    exchange: str = "",
     target_price: float = 0.0,
     target_multiple: int = 0,
     time_horizon_years: int = 5,
@@ -262,19 +256,39 @@ def open_position(
 
     Selects the thematic or momentum template based on strategy.
     Computes target_allocation_gbp per CLAUDE.md rules.
-    Warns if ticker ends in .OL (Oslo Stock Exchange — not accessible).
+    Warns if exchange is OSE (Oslo Stock Exchange — not accessible).
     """
     cfg = load_config()
     positions_dir = _get_positions_dir(cfg)
 
     # Oslo restriction warning
-    yt = yahoo_ticker or ticker
-    if yt.endswith(".OL"):
+    if exchange == "OSE":
         log.warning(
-            "Ticker %s uses Oslo Stock Exchange (.OL) which is not accessible. "
-            "Find the NYSE/NASDAQ equivalent and update yahoo_ticker accordingly.",
-            yt,
+            "Ticker %s uses Oslo Stock Exchange (OSE) which is not accessible. "
+            "Find the NYSE/NASDAQ equivalent and update exchange to NYSE.",
+            ticker,
         )
+
+    # EODHD search-based validation (warn-only; never blocks creation).
+    validation_warning = ""
+    if exchange and exchange != "skip" and VAULT_TO_EODHD.get(exchange) is not None:
+        try:
+            info = _resolve_symbol(
+                ticker,
+                api_key=_eodhd_key(cfg),
+                preferred_exchange=exchange,
+            )
+            resolved = info.get("resolved") or ""
+            expected = build_eodhd_symbol(ticker, exchange) or ""
+            if not resolved:
+                validation_warning = f"⚠ EODHD search returned no matches for '{ticker}' on {exchange}."
+            elif resolved.upper() != expected.upper():
+                validation_warning = (
+                    f"⚠ EODHD search resolved '{ticker}' on {exchange} to {resolved} "
+                    f"(expected {expected}). Double-check before trading."
+                )
+        except Exception as exc:
+            log.warning("open_position: ticker validation skipped for %s: %s", ticker, exc)
 
     # Check for existing position (prevent accidental overwrite)
     filepath = positions_dir / f"{ticker}.md"
@@ -316,8 +330,8 @@ def open_position(
         "tags": ["position"],
     }
 
-    if yahoo_ticker:
-        meta["yahoo_ticker"] = yahoo_ticker
+    if exchange:
+        meta["exchange"] = exchange
 
     if target_alloc is not None:
         meta["target_allocation_gbp"] = target_alloc
@@ -357,6 +371,7 @@ def open_position(
         f"  GBP value: £{market_value_gbp:,.2f}"
         + (f" / Target allocation: £{target_alloc:,.0f}" if target_alloc else "")
         + f"\n  File: {filepath.name}"
+        + (f"\n  {validation_warning}" if validation_warning else "")
     )
 
 
@@ -480,7 +495,13 @@ def add_to_position(
     meta["unrealized_pnl_pct"] = round((price / new_avg_entry - 1) * 100, 1)
     meta["last_updated"] = date_str
 
-    post = append_position_history_row(post, date_str, "Add", shares, price, notes)
+    # First buy into a monitoring position: activate it
+    if old_shares == 0 and meta.get("status") == "monitoring":
+        meta["status"] = "active"
+        meta["entry_date"] = date_str
+
+    action = "Buy" if old_shares == 0 else "Add"
+    post = append_position_history_row(post, date_str, action, shares, price, notes)
     save_position(filepath, post)
 
     return (
@@ -614,49 +635,51 @@ def list_positions(
 def update_all_prices(tickers: list[str] | None = None) -> str:
     """
     Batch-update prices for all active positions (or a filtered list of tickers).
-    Replicates update_prices.py logic but using OpenBB via prices.py.
+    Uses EODHD via prices.py with a narrow yfinance fallback for SGX/BIT.
     """
     cfg = load_config()
     positions_dir = _get_positions_dir(cfg)
-    provider = _default_provider(cfg)
-    fmp_key = _fmp_key(cfg)
+    api_key = _eodhd_key(cfg)
     fallback_fx = cfg.get("fx_rates", {})
 
     filter_set = set(tickers) if tickers else None
 
-    # Collect files to update
-    files_to_update: list[tuple[str, str, Path]] = []  # (yahoo_ticker, broker_ticker, path)
+    files_to_update: list[tuple[str, str, Path, str]] = []  # (fetch_symbol, broker_ticker, path, currency)
     for p in sorted(positions_dir.glob("*.md")):
         post = fm.load(p)
         meta = post.metadata
         broker = meta.get("ticker", "")
         status = meta.get("status", "")
+        exchange = meta.get("exchange", "")
+        currency = meta.get("currency", "")
 
         if status != "active" and not filter_set:
             continue
         if filter_set and broker not in filter_set:
             continue
-
-        yt = meta.get("yahoo_ticker", "")
-        if yt == "skip" or broker == "n/a":
+        if exchange == "skip" or broker == "n/a":
             continue
 
-        fetch = yt or broker
-        files_to_update.append((fetch, broker, p))
+        symbol = (
+            build_eodhd_symbol(broker, exchange)
+            or build_yahoo_symbol(broker, exchange)
+            or broker
+        )
+        files_to_update.append((symbol, broker, p, currency))
 
     if not files_to_update:
         return "No positions to update."
 
-    # Fetch FX rates once
-    fx_rates = get_all_fx_rates(provider=provider, fallback_rates=fallback_fx, fmp_api_key=fmp_key)
+    # Fetch FX rates once (single HTTP call)
+    fx_rates = get_all_fx_rates(api_key=api_key, fallback_rates=fallback_fx)
     save_fx_cache({k: v for k, v in fx_rates.items() if k != "GBP"})
 
     updated = failed = 0
-    lines = [f"Updating {len(files_to_update)} positions (provider: {provider})..."]
+    lines = [f"Updating {len(files_to_update)} positions (provider: eodhd)..."]
 
-    for yahoo_ticker, broker_ticker, filepath in files_to_update:
+    for symbol, broker_ticker, filepath, pos_currency_hint in files_to_update:
         try:
-            q = get_equity_quote(yahoo_ticker, provider=provider, fmp_api_key=fmp_key)
+            q = get_equity_quote(symbol, api_key=api_key, currency_hint=pos_currency_hint or None)
             price = q["price"]
             currency = q["currency"]
 
@@ -717,8 +740,7 @@ def get_portfolio_snapshot() -> list[dict]:
         meta = post.metadata
         if meta.get("status") != "active":
             continue
-        yt = meta.get("yahoo_ticker", "")
-        if yt == "skip" or meta.get("ticker") == "n/a":
+        if meta.get("exchange") == "skip" or meta.get("ticker") == "n/a":
             continue
         rows.append({
             "ticker": meta.get("ticker", ""),

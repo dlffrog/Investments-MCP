@@ -1,273 +1,419 @@
 """
-prices.py — OpenBB-based market data fetching.
+prices.py — market data fetching for the MCP server and vault scripts.
 
-Primary provider: FMP (Financial Modeling Prep).
-Fallback provider: yfinance.
+Provider chain:
+  1. EODHD REST (primary — uses investments_mcp.eodhd_client.EODHDClient)
+  2. yfinance (narrow fallback for exchanges EODHD does not cover, e.g. SGX)
 
-This module is shared between the MCP server and Scripts/update_prices.py in
-the vault. Both import from here so there is one data source throughout.
-
-Exported functions:
-    get_equity_quote(symbol, provider) -> dict
-    get_fx_rate(currency, provider) -> float          # units per GBP
-    get_historical_ohlcv(symbol, start, end, provider) -> list[dict]
-    get_all_fx_rates(provider) -> dict[str, float]    # all supported currencies
+Public surface is kept stable so Scripts/update_prices.py, server.py, and
+trade_ops.py don't need to change their call sites.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
 from typing import Any
+
+from .eodhd_client import EODHDClient, EODHDError
+from .exchanges import (
+    VAULT_TO_EODHD,
+    VAULT_TO_YAHOO,
+    build_eodhd_symbol,
+    build_yahoo_symbol,
+    has_eodhd_coverage,
+)
 
 log = logging.getLogger(__name__)
 
+
 # Currencies supported for GBP cross-rate fetching.
-# Key: ISO code used in position files. Value: FX pair symbol (GBP base).
+# Value: EODHD forex symbol (GBP base, quote currency).
 SUPPORTED_CURRENCIES: dict[str, str] = {
-    "USD": "GBPUSD",
-    "CAD": "GBPCAD",
-    "EUR": "GBPEUR",
-    "AUD": "GBPAUD",
-    "HKD": "GBPHKD",
-    "SGD": "GBPSGD",
-    "PLN": "GBPPLN",
-    "ILS": "GBPILS",
-    "NOK": "GBPNOK",
-    "MXN": "GBPMXN",
+    "USD": "GBPUSD.FOREX",
+    "CAD": "GBPCAD.FOREX",
+    "EUR": "GBPEUR.FOREX",
+    "AUD": "GBPAUD.FOREX",
+    "HKD": "GBPHKD.FOREX",
+    "SGD": "GBPSGD.FOREX",
+    "PLN": "GBPPLN.FOREX",
+    "ILS": "GBPILS.FOREX",
+    "NOK": "GBPNOK.FOREX",
+    "MXN": "GBPMXN.FOREX",
 }
 
-_obb_initialised = False
 
+# ---------------------------------------------------------------------------
+# Legacy symbol-building shim
+# ---------------------------------------------------------------------------
 
-def _init_openbb(fmp_api_key: str | None = None) -> None:
-    """Initialise OpenBB credentials once per process."""
-    global _obb_initialised
-    if _obb_initialised:
-        return
-    try:
-        from openbb import obb  # noqa: F401 — triggers provider registration
-
-        if fmp_api_key:
-            try:
-                obb.user.credentials.fmp_api_key = fmp_api_key
-            except Exception:
-                pass  # Older OpenBB versions may not have this attribute
-    except ImportError:
-        log.warning("openbb package not installed; price fetching will fail")
-    _obb_initialised = True
-
-
-def _get_obb():
-    """Return the openbb module, raising clearly if not installed."""
-    try:
-        from openbb import obb
-        return obb
-    except ImportError as exc:
-        raise RuntimeError(
-            "openbb is not installed. Run: pip install openbb openbb-fmp openbb-yfinance"
-        ) from exc
+def build_symbol(ticker: str, exchange: str) -> str | None:
+    """
+    Legacy alias: return an EODHD symbol if the exchange is covered,
+    otherwise a yfinance fallback symbol. Returns None when exchange is
+    'skip'/empty/unknown.
+    """
+    eodhd = build_eodhd_symbol(ticker, exchange)
+    if eodhd is not None:
+        return eodhd
+    return build_yahoo_symbol(ticker, exchange)
 
 
 # ---------------------------------------------------------------------------
-# Price normalisation helpers
+# Price normalisation
 # ---------------------------------------------------------------------------
+
+def _coerce_na(value: Any) -> Any:
+    """EODHD uses the string 'NA' for missing real-time fields; treat as None."""
+    if value in (None, "NA", "N/A", ""):
+        return None
+    return value
+
 
 def _normalise_price(price: float | None, currency: str) -> tuple[float, str]:
     """Convert GBX/GBp prices to GBP. Returns (price, normalised_currency)."""
     if price is None:
         raise ValueError("No price returned from provider")
     if currency in ("GBX", "GBp", "GBx"):
-        return price / 100.0, "GBP"
+        return float(price) / 100.0, "GBP"
     return float(price), currency
 
 
-def _extract_quote_fields(result: Any, provider: str) -> tuple[float, str]:
-    """
-    Extract (price, currency) from an OpenBB quote result.
-    Handles field-name differences between providers.
-    """
-    if not result.results:
-        raise ValueError(f"Empty results from {provider}")
-    q = result.results[0]
+# ---------------------------------------------------------------------------
+# Client factory & caches
+# ---------------------------------------------------------------------------
 
-    # Field names vary by provider
-    price = (
-        getattr(q, "price", None)          # FMP
-        or getattr(q, "last_price", None)   # yfinance
-        or getattr(q, "close", None)        # some providers
-    )
-    currency = getattr(q, "currency", None) or "USD"
+_client_cache: dict[str, EODHDClient] = {}
 
-    if price is None or float(price) <= 0:
-        raise ValueError(f"Invalid price ({price}) from {provider}")
 
-    return _normalise_price(float(price), currency)
+def _get_client(api_key: str | None) -> EODHDClient:
+    key = api_key or ""
+    if key not in _client_cache:
+        _client_cache[key] = EODHDClient(api_key=api_key or None)
+    return _client_cache[key]
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# yfinance fallback (lazy import — only used for SGX-like gaps)
+# ---------------------------------------------------------------------------
+
+def _yf_quote(symbol: str) -> dict[str, Any]:
+    """Return {'price','currency','change_pct','volume'} for a yfinance symbol."""
+    import yfinance as yf  # Lazy import; only pulled in when needed.
+
+    t = yf.Ticker(symbol)
+    info = t.fast_info if hasattr(t, "fast_info") else {}
+    price = None
+    currency = "USD"
+    try:
+        price = float(info["last_price"]) if info.get("last_price") else None
+        currency = info.get("currency") or "USD"
+    except Exception:
+        pass
+    if price is None:
+        hist = t.history(period="5d")
+        if hist.empty:
+            raise ValueError(f"yfinance returned no data for {symbol}")
+        price = float(hist["Close"].iloc[-1])
+        currency = getattr(t, "info", {}).get("currency", currency)
+    prev_close = info.get("previous_close") if hasattr(info, "get") else None
+    change_pct = None
+    if prev_close and prev_close > 0:
+        change_pct = (price / float(prev_close) - 1) * 100
+    return {
+        "price": price,
+        "currency": currency,
+        "change_pct": change_pct,
+        "volume": info.get("last_volume") if hasattr(info, "get") else None,
+    }
+
+
+def _yf_historical(symbol: str, start: str, end: str | None) -> list[dict]:
+    import yfinance as yf
+
+    t = yf.Ticker(symbol)
+    hist = t.history(start=start, end=end) if end else t.history(start=start)
+    if hist.empty:
+        return []
+    rows = []
+    for ts, row in hist.iterrows():
+        rows.append({
+            "date": ts.strftime("%Y-%m-%d"),
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": int(row["Volume"]) if row["Volume"] else None,
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Public API — equity quotes
 # ---------------------------------------------------------------------------
 
 def get_equity_quote(
     symbol: str,
-    provider: str = "fmp",
-    fmp_api_key: str | None = None,
+    api_key: str | None = None,
+    currency_hint: str | None = None,
+    **_ignored: Any,
 ) -> dict:
     """
-    Fetch a live equity quote for `symbol`.
+    Fetch a live equity quote.
 
-    Returns a dict with keys:
-        price (float), currency (str), change_pct (float | None),
-        volume (int | None), provider (str), symbol (str)
+    `symbol` is expected in `{TICKER}.{EXCHANGE}` form. If it looks like a
+    Yahoo-style symbol (no dot or an unknown suffix), the EODHD client will
+    interpret a dot-less symbol as US; a yfinance fallback kicks in only
+    when EODHD returns an error for an already-routed symbol.
 
-    Raises ValueError if no valid price is returned.
-    Falls back to yfinance if FMP fails and provider == "fmp".
+    `currency_hint`: when provided, overrides the exchange-based currency
+    inference. Use this for instruments whose currency differs from the
+    exchange default (e.g. EUR-denominated ETFs listed on the LSE).
+
+    Returns: {price, currency, change_pct, volume, provider, symbol}
     """
-    _init_openbb(fmp_api_key)
-    obb = _get_obb()
+    client = _get_client(api_key)
 
-    providers_to_try = [provider]
-    if provider == "fmp":
-        providers_to_try.append("yfinance")  # automatic fallback
+    # Heuristic: if symbol has a Yahoo-style suffix not in EODHD's exchanges,
+    # skip straight to yfinance. We detect this by inspecting the trailing
+    # component; callers using build_symbol() already route correctly.
+    yahoo_suffixes_unsupported = {".SI", ".MI"}
+    if any(symbol.upper().endswith(sfx) for sfx in yahoo_suffixes_unsupported):
+        q = _yf_quote(symbol)
+        price, currency = _normalise_price(q["price"], q["currency"])
+        return {
+            "price": price,
+            "currency": currency,
+            "change_pct": round(q["change_pct"], 4) if q["change_pct"] is not None else None,
+            "volume": q["volume"],
+            "provider": "yfinance",
+            "symbol": symbol,
+        }
 
-    last_exc: Exception | None = None
-    for prov in providers_to_try:
+    try:
+        data = client.real_time_quote(symbol)
+        price = _coerce_na(data.get("close")) or _coerce_na(data.get("previousClose"))
+        if price is None:
+            raise ValueError(f"EODHD returned no price for {symbol} (likely unsupported ticker)")
+        currency = currency_hint or _infer_currency_from_symbol(symbol)
+        price, currency = _normalise_price(float(price), currency)
+        change_pct = _coerce_na(data.get("change_p"))
+        return {
+            "price": price,
+            "currency": currency,
+            "change_pct": round(float(change_pct), 4) if change_pct is not None else None,
+            "volume": _coerce_na(data.get("volume")),
+            "provider": "eodhd",
+            "symbol": symbol,
+        }
+    except (EODHDError, ValueError, TypeError) as exc:
+        log.warning("EODHD quote for %s failed: %s", symbol, exc)
+        # Last-ditch yfinance attempt — only helps when `symbol` happens to
+        # have a yahoo-parseable form.
         try:
-            result = obb.equity.price.quote(symbol, provider=prov)
-            price, currency = _extract_quote_fields(result, prov)
-
-            q = result.results[0]
-            change_pct = (
-                getattr(q, "changes_percentage", None)       # FMP
-                or getattr(q, "regular_market_change_percent", None)  # yfinance
-                or getattr(q, "change_percent", None)
-            )
-
+            q = _yf_quote(symbol)
+            price, currency = _normalise_price(q["price"], q["currency"])
             return {
                 "price": price,
                 "currency": currency,
-                "change_pct": round(float(change_pct), 4) if change_pct is not None else None,
-                "volume": getattr(q, "volume", None),
-                "provider": prov,
+                "change_pct": round(q["change_pct"], 4) if q["change_pct"] is not None else None,
+                "volume": q["volume"],
+                "provider": "yfinance",
                 "symbol": symbol,
             }
-        except Exception as exc:
-            log.warning("get_equity_quote %s via %s failed: %s", symbol, prov, exc)
-            last_exc = exc
-
-    raise ValueError(f"Could not fetch quote for {symbol}: {last_exc}") from last_exc
+        except Exception as yf_exc:
+            raise ValueError(f"Could not fetch quote for {symbol}: {exc}; yfinance fallback: {yf_exc}") from exc
 
 
-def get_fx_rate(
-    currency: str,
-    provider: str = "fmp",
-    fallback_rates: dict[str, float] | None = None,
-    fmp_api_key: str | None = None,
-) -> float:
+def _infer_currency_from_symbol(symbol: str) -> str:
     """
-    Return the current exchange rate for `currency` expressed as units-per-GBP.
-    e.g. get_fx_rate("USD") → 1.28 means £1 = $1.28
-
-    Falls back to yfinance then to fallback_rates dict on failure.
+    EODHD's real-time payload does not always include a currency field.
+    Infer it from the exchange suffix so the caller gets a sane value.
     """
-    if currency == "GBP":
-        return 1.0
-
-    pair = SUPPORTED_CURRENCIES.get(currency.upper())
-    if not pair:
-        log.warning("Unsupported currency %s, returning 1.0", currency)
-        return fallback_rates.get(currency, 1.0) if fallback_rates else 1.0
-
-    _init_openbb(fmp_api_key)
-    obb = _get_obb()
-
-    providers_to_try = [provider, "yfinance"] if provider == "fmp" else [provider]
-
-    for prov in providers_to_try:
-        try:
-            # Use recent historical data (last 3 days) to get latest rate
-            start = (date.today() - timedelta(days=5)).isoformat()
-            result = obb.currency.price.historical(pair, start_date=start, provider=prov)
-            if result.results:
-                q = result.results[-1]  # most recent
-                rate = (
-                    getattr(q, "close", None)
-                    or getattr(q, "last_price", None)
-                    or getattr(q, "rate", None)
-                )
-                if rate and float(rate) > 0:
-                    return float(rate)
-        except Exception as exc:
-            log.warning("get_fx_rate %s via %s failed: %s", pair, prov, exc)
-
-    # Last resort: config fallback
-    if fallback_rates and currency in fallback_rates:
-        log.warning("Using cached FX rate for %s: %s", currency, fallback_rates[currency])
-        return fallback_rates[currency]
-
-    log.warning("No FX rate for %s, defaulting to 1.0", currency)
-    return 1.0
+    if "." not in symbol:
+        return "USD"
+    suffix = symbol.rsplit(".", 1)[1].upper()
+    suffix_to_ccy = {
+        "US": "USD",
+        "LSE": "GBX",  # LSE prices are GBX — _normalise_price converts to GBP.
+        "TO": "CAD", "V": "CAD",
+        "XETRA": "EUR", "F": "EUR", "PA": "EUR", "AS": "EUR", "LS": "EUR",
+        "VI": "EUR", "AT": "EUR", "BR": "EUR", "HE": "EUR", "IR": "EUR",
+        "MC": "EUR", "LU": "EUR",
+        "SW": "CHF",
+        "HK": "HKD",
+        "AU": "AUD",
+        "WAR": "PLN",
+        "TA": "ILS",
+        "OL": "NOK",
+        "ST": "SEK",
+        "CO": "DKK",
+        "FOREX": "",
+    }
+    return suffix_to_ccy.get(suffix, "USD")
 
 
-def get_all_fx_rates(
-    provider: str = "fmp",
-    fallback_rates: dict[str, float] | None = None,
-    fmp_api_key: str | None = None,
-) -> dict[str, float]:
-    """
-    Fetch GBP cross-rates for all supported currencies in one pass.
-    Returns dict {currency_code: units_per_gbp}, always includes GBP: 1.0.
-    """
-    rates: dict[str, float] = {"GBP": 1.0}
-    for currency in SUPPORTED_CURRENCIES:
-        rates[currency] = get_fx_rate(
-            currency,
-            provider=provider,
-            fallback_rates=fallback_rates,
-            fmp_api_key=fmp_api_key,
-        )
-    return rates
-
+# ---------------------------------------------------------------------------
+# Public API — historical
+# ---------------------------------------------------------------------------
 
 def get_historical_ohlcv(
     symbol: str,
     start_date: str,
     end_date: str | None = None,
-    provider: str = "fmp",
-    fmp_api_key: str | None = None,
+    api_key: str | None = None,
+    **_ignored: Any,
 ) -> list[dict]:
     """
-    Fetch daily OHLCV history for `symbol`.
-
-    Returns a list of dicts with keys: date, open, high, low, close, volume.
-    Most recent date last.
+    Return daily OHLCV rows in `[{date, open, high, low, close, volume}, ...]`.
+    Most recent row last. Falls back to yfinance for exchanges EODHD lacks.
     """
-    _init_openbb(fmp_api_key)
-    obb = _get_obb()
+    if any(symbol.upper().endswith(sfx) for sfx in (".SI", ".MI")):
+        return _yf_historical(symbol, start_date, end_date)
 
-    providers_to_try = [provider, "yfinance"] if provider == "fmp" else [provider]
-    last_exc: Exception | None = None
-
-    for prov in providers_to_try:
+    client = _get_client(api_key)
+    try:
+        rows = client.historical_eod(symbol, start=start_date, end=end_date)
+        return [
+            {
+                "date": str(r.get("date", ""))[:10],
+                "open": r.get("open"),
+                "high": r.get("high"),
+                "low": r.get("low"),
+                "close": r.get("close"),
+                "volume": r.get("volume"),
+            }
+            for r in rows
+        ]
+    except EODHDError as exc:
+        log.warning("EODHD historical for %s failed: %s", symbol, exc)
         try:
-            kwargs: dict[str, Any] = {"start_date": start_date, "provider": prov}
-            if end_date:
-                kwargs["end_date"] = end_date
-            result = obb.equity.price.historical(symbol, **kwargs)
-            return [
-                {
-                    "date": str(getattr(r, "date", ""))[:10],
-                    "open": getattr(r, "open", None),
-                    "high": getattr(r, "high", None),
-                    "low": getattr(r, "low", None),
-                    "close": getattr(r, "close", None),
-                    "volume": getattr(r, "volume", None),
-                }
-                for r in result.results
-            ]
-        except Exception as exc:
-            log.warning("get_historical_ohlcv %s via %s failed: %s", symbol, prov, exc)
-            last_exc = exc
+            return _yf_historical(symbol, start_date, end_date)
+        except Exception as yf_exc:
+            raise ValueError(f"Could not fetch history for {symbol}: {exc}; yfinance: {yf_exc}") from exc
 
-    raise ValueError(f"Could not fetch history for {symbol}: {last_exc}") from last_exc
+
+# ---------------------------------------------------------------------------
+# Public API — FX rates
+# ---------------------------------------------------------------------------
+
+def get_fx_rate(
+    currency: str,
+    api_key: str | None = None,
+    fallback_rates: dict[str, float] | None = None,
+    **_ignored: Any,
+) -> float:
+    """Return units-per-GBP for `currency`. e.g. get_fx_rate('USD') → ~1.28."""
+    if currency == "GBP":
+        return 1.0
+
+    pair = SUPPORTED_CURRENCIES.get(currency.upper())
+    if not pair:
+        log.warning("Unsupported currency %s; returning 1.0", currency)
+        return fallback_rates.get(currency, 1.0) if fallback_rates else 1.0
+
+    client = _get_client(api_key)
+    try:
+        data = client.real_time_quote(pair)
+        rate = data.get("close") or data.get("previousClose")
+        if rate and float(rate) > 0:
+            return float(rate)
+    except EODHDError as exc:
+        log.warning("EODHD FX for %s failed: %s", pair, exc)
+
+    if fallback_rates and currency in fallback_rates:
+        log.warning("Using cached FX rate for %s: %s", currency, fallback_rates[currency])
+        return float(fallback_rates[currency])
+    log.warning("No FX rate for %s, defaulting to 1.0", currency)
+    return 1.0
+
+
+def get_all_fx_rates(
+    api_key: str | None = None,
+    fallback_rates: dict[str, float] | None = None,
+    **_ignored: Any,
+) -> dict[str, float]:
+    """
+    Fetch GBP cross-rates for every supported currency in a single HTTP call
+    via EODHD's bulk real-time endpoint. Always includes GBP: 1.0.
+    """
+    rates: dict[str, float] = {"GBP": 1.0}
+    pairs = list(SUPPORTED_CURRENCIES.values())
+    client = _get_client(api_key)
+    try:
+        bulk = client.bulk_real_time(pairs)
+        for ccy, pair in SUPPORTED_CURRENCIES.items():
+            row = bulk.get(pair) or {}
+            rate = row.get("close") or row.get("previousClose")
+            if rate and float(rate) > 0:
+                rates[ccy] = float(rate)
+            elif fallback_rates and ccy in fallback_rates:
+                rates[ccy] = float(fallback_rates[ccy])
+                log.warning("Using cached FX rate for %s", ccy)
+            else:
+                rates[ccy] = 1.0
+                log.warning("No FX rate for %s; defaulted to 1.0", ccy)
+        return rates
+    except EODHDError as exc:
+        log.warning("Bulk FX fetch failed, falling back per-currency: %s", exc)
+        for ccy in SUPPORTED_CURRENCIES:
+            rates[ccy] = get_fx_rate(ccy, api_key=api_key, fallback_rates=fallback_rates)
+        return rates
+
+
+# ---------------------------------------------------------------------------
+# Public API — ticker resolver
+# ---------------------------------------------------------------------------
+
+def resolve_ticker(
+    query: str,
+    api_key: str | None = None,
+    preferred_exchange: str | None = None,
+    asset_type: str | None = None,
+) -> dict:
+    """
+    Resolve a name or ambiguous ticker to an EODHD `{CODE}.{EXCHANGE}` symbol.
+
+    Returns {'resolved', 'name', 'isin', 'type', 'exchange', 'currency', 'alternatives'}.
+    `resolved` is None when EODHD returns no matches.
+    """
+    client = _get_client(api_key)
+    # Translate vault code to EODHD exchange code if provided.
+    eodhd_exchange: str | None = None
+    if preferred_exchange:
+        eodhd_exchange = VAULT_TO_EODHD.get(preferred_exchange, preferred_exchange)
+
+    try:
+        matches = client.search(
+            query,
+            preferred_exchange=eodhd_exchange,
+            asset_type=asset_type,
+            limit=10,
+        )
+    except EODHDError as exc:
+        return {"resolved": None, "error": str(exc), "alternatives": []}
+
+    if not matches:
+        return {"resolved": None, "alternatives": []}
+
+    top = matches[0]
+    code = top.get("Code", "")
+    exchange = top.get("Exchange", "")
+    symbol = f"{code}.{exchange}" if code and exchange else code
+    return {
+        "resolved": symbol,
+        "name": top.get("Name"),
+        "isin": top.get("ISIN"),
+        "type": top.get("Type"),
+        "exchange": exchange,
+        "currency": top.get("Currency"),
+        "alternatives": [
+            {
+                "symbol": f"{m.get('Code','')}.{m.get('Exchange','')}",
+                "name": m.get("Name"),
+                "exchange": m.get("Exchange"),
+                "currency": m.get("Currency"),
+                "type": m.get("Type"),
+            }
+            for m in matches[1:6]
+        ],
+    }

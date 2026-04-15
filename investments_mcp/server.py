@@ -20,6 +20,7 @@ Register from another machine:
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from typing import Optional
@@ -27,9 +28,14 @@ from typing import Optional
 import uvicorn
 from fastmcp import FastMCP
 
-from .config import load_config
-from .prices import get_equity_quote, get_fx_rate, get_historical_ohlcv, get_all_fx_rates
-from .config import save_fx_cache
+from .config import load_config, save_fx_cache
+from .prices import (
+    get_equity_quote,
+    get_fx_rate,
+    get_historical_ohlcv,
+    resolve_ticker as _resolve_ticker,
+)
+from .exchanges import build_eodhd_symbol, build_yahoo_symbol
 from .trade_ops import (
     close_position as _close_position,
     open_position as _open_position,
@@ -144,7 +150,7 @@ def open_position(
     entry_date: str,
     currency: str,
     sector: str,
-    yahoo_ticker: str = "",
+    exchange: str = "",
     target_price: float = 0.0,
     target_multiple: int = 0,
     time_horizon_years: int = 5,
@@ -160,6 +166,7 @@ def open_position(
     Create a new position file (TICKER.md) with frontmatter and body stub.
 
     strategy must be one of the 10 vault strategies.
+    exchange: exchange code (e.g. "LSE", "TSX", "NYSE").
     For Crowded Market Report: provide stop_loss, risk_pct, atr_multiple.
     For Asymmetric Capital Gains: provide theme (e.g. "Agriculture", "Shipping").
     For Dividend Portfolio: provide country.
@@ -169,7 +176,7 @@ def open_position(
         return _open_position(
             ticker=ticker, name=name, strategy=strategy,
             entry_price=entry_price, shares=shares, entry_date=entry_date,
-            currency=currency, sector=sector, yahoo_ticker=yahoo_ticker,
+            currency=currency, sector=sector, exchange=exchange,
             target_price=target_price, target_multiple=target_multiple,
             time_horizon_years=time_horizon_years, catalyst=catalyst,
             catalyst_date=catalyst_date, stop_loss=stop_loss,
@@ -280,20 +287,26 @@ def list_positions(strategy: str = "", status: str = "active") -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_quote(ticker: str, yahoo_ticker: str = "", provider: str = "fmp") -> str:
+def get_quote(ticker: str, exchange: str = "", currency: str = "") -> str:
     """
-    Fetch a live price quote for a ticker via OpenBB.
-    yahoo_ticker: override the symbol sent to the provider (e.g. "WPP.L" for LSE).
-    provider: fmp (default) or yfinance.
+    Fetch a live price quote for a ticker via EODHD.
+    exchange: exchange code (e.g. "LSE", "TSX", "NYSE"). If blank, the name
+    or ticker is resolved through EODHD's search endpoint.
+    currency: optional hint (e.g. "EUR", "USD") to override the default
+    exchange-based currency inference. Use for instruments whose currency
+    differs from the exchange norm (e.g. EUR-denominated ETFs on the LSE).
     """
     try:
         cfg = load_config()
-        symbol = yahoo_ticker or ticker
-        q = get_equity_quote(
-            symbol,
-            provider=provider or "fmp",
-            fmp_api_key=cfg.get("fmp", {}).get("api_key"),
-        )
+        key = cfg.get("eodhd", {}).get("api_key")
+
+        if exchange:
+            symbol = build_eodhd_symbol(ticker, exchange) or build_yahoo_symbol(ticker, exchange) or ticker
+        else:
+            info = _resolve_ticker(ticker, api_key=key)
+            symbol = info.get("resolved") or ticker
+
+        q = get_equity_quote(symbol, api_key=key, currency_hint=currency or None)
         change = q.get("change_pct")
         change_str = f" ({change:+.2f}%)" if change is not None else ""
         return (
@@ -310,22 +323,27 @@ def get_historical(
     ticker: str,
     start_date: str,
     end_date: str = "",
-    yahoo_ticker: str = "",
-    provider: str = "fmp",
+    exchange: str = "",
 ) -> str:
     """
-    Fetch historical OHLCV data for a ticker.
+    Fetch historical OHLCV data for a ticker via EODHD.
     start_date / end_date format: YYYY-MM-DD
+    exchange: exchange code (e.g. "LSE", "TSX", "NYSE"). If blank, the name
+    or ticker is resolved through EODHD's search endpoint.
     """
     try:
         cfg = load_config()
-        symbol = yahoo_ticker or ticker
+        key = cfg.get("eodhd", {}).get("api_key")
+        if exchange:
+            symbol = build_eodhd_symbol(ticker, exchange) or build_yahoo_symbol(ticker, exchange) or ticker
+        else:
+            info = _resolve_ticker(ticker, api_key=key)
+            symbol = info.get("resolved") or ticker
         rows = get_historical_ohlcv(
             symbol,
             start_date=start_date,
             end_date=end_date or None,
-            provider=provider or "fmp",
-            fmp_api_key=cfg.get("fmp", {}).get("api_key"),
+            api_key=key,
         )
         if not rows:
             return f"No historical data returned for {symbol}"
@@ -346,9 +364,9 @@ def get_historical(
 
 
 @mcp.tool()
-def get_fx_rate_tool(currency: str, provider: str = "fmp") -> str:
+def get_fx_rate_tool(currency: str) -> str:
     """
-    Fetch the current GBP cross-rate for a currency.
+    Fetch the current GBP cross-rate for a currency via EODHD.
     Returns units-per-GBP (e.g. USD: 1.28 means £1 = $1.28).
     currency: USD, CAD, EUR, AUD, HKD, SGD, PLN, ILS, NOK, MXN
     """
@@ -357,12 +375,47 @@ def get_fx_rate_tool(currency: str, provider: str = "fmp") -> str:
         fallback = cfg.get("fx_rates", {})
         rate = get_fx_rate(
             currency,
-            provider=provider or "fmp",
+            api_key=cfg.get("eodhd", {}).get("api_key"),
             fallback_rates=fallback,
-            fmp_api_key=cfg.get("fmp", {}).get("api_key"),
         )
         save_fx_cache({currency: rate})
         return f"£1 = {rate:.6f} {currency}"
+    except Exception as exc:
+        return _fmt_error(exc)
+
+
+@mcp.tool()
+def resolve_ticker(query: str, preferred_exchange: str = "", asset_type: str = "") -> str:
+    """
+    Resolve a company name or ambiguous ticker to an EODHD symbol via search.
+
+    query: name or ticker (e.g. "Apple", "Vopak", "BMW")
+    preferred_exchange: optional vault exchange code to bias the match (e.g. "LSE")
+    asset_type: optional EODHD type filter (e.g. "Common Stock", "ETF")
+    """
+    try:
+        cfg = load_config()
+        info = _resolve_ticker(
+            query,
+            api_key=cfg.get("eodhd", {}).get("api_key"),
+            preferred_exchange=preferred_exchange or None,
+            asset_type=asset_type or None,
+        )
+        if not info.get("resolved"):
+            return f"No matches for '{query}'."
+        lines = [
+            f"Resolved: {info['resolved']}",
+            f"  Name:     {info.get('name') or '—'}",
+            f"  ISIN:     {info.get('isin') or '—'}",
+            f"  Type:     {info.get('type') or '—'}",
+            f"  Currency: {info.get('currency') or '—'}",
+        ]
+        alts = info.get("alternatives") or []
+        if alts:
+            lines.append("\nAlternatives:")
+            for a in alts:
+                lines.append(f"  - {a['symbol']:<20} {a.get('name') or ''} ({a.get('currency') or ''})")
+        return "\n".join(lines)
     except Exception as exc:
         return _fmt_error(exc)
 
@@ -431,20 +484,34 @@ def check_exits(verbose: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(description="investments-mcp server")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Run HTTP transport (port 8765) instead of stdio. Use for remote access via SSH tunnel.",
+    )
+    args = parser.parse_args()
+
     cfg = load_config()
     server_cfg = cfg.get("server", {})
+
+    if not args.http:
+        # Stdio transport — used for local Claude Code registration.
+        # No OAuth metadata, no port binding, no auth needed.
+        log.info("Starting investments-mcp (stdio transport)")
+        mcp.run()
+        return
+
+    # HTTP transport — for remote access via SSH tunnel or LAN.
     port = int(server_cfg.get("port", 8765))
     host = server_cfg.get("host", "0.0.0.0")
     auth_token = server_cfg.get("auth_token", "")
 
-    log.info("Starting investments-mcp on %s:%d", host, port)
+    log.info("Starting investments-mcp on %s:%d (HTTP transport)", host, port)
 
-    # Get the FastMCP ASGI app.
-    # FastMCP 3.x uses streamable-HTTP via http_app() → endpoint /mcp
     try:
         app = mcp.http_app()
     except AttributeError:
-        # FastMCP 2.x fallback
         try:
             app = mcp.sse_app()
             log.info("Using SSE transport (FastMCP 2.x) — endpoint: /sse")
@@ -457,12 +524,9 @@ def main():
     else:
         log.info("Using streamable-HTTP transport (FastMCP 3.x) — endpoint: /mcp")
 
-    # Note: FastMCP 3.x's HTTP transport exposes OAuth discovery endpoints which
-    # interfere with Claude Code's tool registration when wrapping with custom auth.
-    # Auth is handled at the network level (firewall/VPN) for remote access.
-    # The bearer token in config is reserved for a future auth implementation.
     if auth_token:
-        log.info("Auth token configured (network-level enforcement — not applied in-process)")
+        app = _BearerAuth(app, auth_token)
+        log.info("Bearer token auth enabled for non-localhost connections")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
