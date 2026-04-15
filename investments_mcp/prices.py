@@ -97,33 +97,44 @@ def _get_client(api_key: str | None) -> EODHDClient:
 # ---------------------------------------------------------------------------
 
 def _yf_quote(symbol: str) -> dict[str, Any]:
-    """Return {'price','currency','change_pct','volume'} for a yfinance symbol."""
+    """Return {'price','currency','change_pct','volume'} for a yfinance symbol.
+
+    Uses historical EOD close rather than real-time fast_info, so that prices
+    remain valid when markets are closed (e.g. SGX during European hours).
+    """
     import yfinance as yf  # Lazy import; only pulled in when needed.
 
     t = yf.Ticker(symbol)
-    info = t.fast_info if hasattr(t, "fast_info") else {}
-    price = None
+
+    # Always use history — real-time fast_info returns NaN or empty for closed
+    # markets, whereas EOD history always contains the last completed session.
+    hist = t.history(period="5d")
+    if hist.empty:
+        raise ValueError(f"yfinance returned no data for {symbol}")
+
+    closes = hist["Close"].dropna()
+    if closes.empty:
+        raise ValueError(f"yfinance returned all-NaN closes for {symbol}")
+
+    price = float(closes.iloc[-1])
+    prev_price = float(closes.iloc[-2]) if len(closes) >= 2 else None
+
+    # Currency comes from the slower .info dict; safe to skip if unavailable.
     currency = "USD"
     try:
-        price = float(info["last_price"]) if info.get("last_price") else None
-        currency = info.get("currency") or "USD"
+        currency = t.fast_info.get("currency") or "USD"
     except Exception:
         pass
-    if price is None:
-        hist = t.history(period="5d")
-        if hist.empty:
-            raise ValueError(f"yfinance returned no data for {symbol}")
-        price = float(hist["Close"].iloc[-1])
-        currency = getattr(t, "info", {}).get("currency", currency)
-    prev_close = info.get("previous_close") if hasattr(info, "get") else None
+
     change_pct = None
-    if prev_close and prev_close > 0:
-        change_pct = (price / float(prev_close) - 1) * 100
+    if prev_price and prev_price > 0:
+        change_pct = (price / prev_price - 1) * 100
+
     return {
         "price": price,
         "currency": currency,
-        "change_pct": change_pct,
-        "volume": info.get("last_volume") if hasattr(info, "get") else None,
+        "change_pct": round(change_pct, 4) if change_pct is not None else None,
+        "volume": int(hist["Volume"].iloc[-1]) if not hist["Volume"].empty else None,
     }
 
 
