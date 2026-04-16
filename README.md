@@ -1,6 +1,6 @@
 # investments-mcp
 
-A local MCP server for managing an Obsidian-based investment vault. Exposes 12 tools covering trade operations and live market data via OpenBB + FMP.
+A local MCP server for managing an Obsidian-based investment vault. Exposes 15 tools covering trade operations, live market data via EODHD (yfinance fallback for SGX/Borsa Italiana), and dividend tracking.
 
 Runs persistently on the machine that holds the vault. Accessible from any machine on your local network via SSE transport.
 
@@ -16,13 +16,20 @@ Runs persistently on the machine that holds the vault. Accessible from any machi
 | `get_position` | Read frontmatter (read-only) |
 | `list_positions` | List positions by strategy/status |
 
-### Market data (OpenBB)
+### Dividend tracking
 | Tool | What it does |
 |------|-------------|
-| `get_quote` | Live price via FMP (falls back to yfinance) |
-| `get_historical` | OHLCV history |
-| `get_fx_rate_tool` | Live GBP cross-rate; updates config cache |
-| `update_all_prices` | Batch price update for all active positions |
+| `log_dividend` | Record a received dividend payment: appends to `_dividend_log.json` and increments `dividends_received_gbp` in the position's frontmatter. Accepts total broker amount (not per-share). Works for active and closed positions via `shares_at_payment`. |
+| `get_dividend_history` | Query `_dividend_log.json` with optional filters for ticker, strategy, and year. Returns a formatted table with per-entry and total GBP figures. |
+| `update_dividends` | Fetch trailing 12-month dividend data from EODHD (yfinance fallback for SGX) for all active positions and write four frontmatter fields: `div_per_share`, `div_yield_pct`, `div_income_gbp`, `next_ex_div_date`. Pass a list of tickers to update specific positions only. |
+
+### Market data (EODHD)
+| Tool | What it does |
+|------|-------------|
+| `get_quote` | Live price via EODHD (yfinance fallback for SGX/Borsa Italiana) |
+| `get_historical` | OHLCV history via EODHD (yfinance fallback) |
+| `get_fx_rate_tool` | Live GBP cross-rate via EODHD; updates config cache |
+| `update_all_prices` | Batch price update for all active positions via EODHD |
 | `get_portfolio_snapshot` | All active positions with last-cached values |
 | `check_exits` | Exit alerts (stop-loss, drawdown, target proximity) |
 

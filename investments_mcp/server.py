@@ -483,7 +483,7 @@ def resolve_ticker(query: str, preferred_exchange: str = "", asset_type: str = "
 @mcp.tool()
 def update_all_prices(tickers: str = "") -> str:
     """
-    Batch-update prices for all active vault positions using OpenBB.
+    Batch-update prices for all active vault positions using EODHD.
     tickers: optional comma-separated list to update only specific tickers, e.g. "AAPL,QCOM"
     Equivalent to running Scripts/update_prices.py.
     """
