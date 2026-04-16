@@ -77,6 +77,10 @@ def resolve_ticker(
                     return ags_path
                 if "Dividend" in strategy or "DIV" in strategy.upper():
                     return div_path
+                # Try arbitrary suffix (e.g. "SHP" for FRO-SHP.md)
+                suffix_path = positions_dir / f"{ticker}-{strategy.upper()}.md"
+                if suffix_path.exists():
+                    return suffix_path
             raise AmbiguousTicker(ticker, candidates)
 
         if len(candidates) == 1:

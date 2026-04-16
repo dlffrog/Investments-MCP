@@ -16,6 +16,7 @@ Derived-field formulas (from CLAUDE.md):
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date
 from pathlib import Path
@@ -578,6 +579,161 @@ def trim_position(
 
 
 # ---------------------------------------------------------------------------
+# log_dividend
+# ---------------------------------------------------------------------------
+
+def log_dividend(
+    ticker: str,
+    total_amount: float,
+    date_str: str,
+    currency: str | None = None,
+    strategy: str | None = None,
+    amount_per_share: float = 0.0,
+    shares_at_payment: int = 0,
+) -> str:
+    """
+    Record a received dividend payment.
+
+    Appends a dated entry to _dividend_log.json and increments
+    dividends_received_gbp in the position's frontmatter.
+
+    total_amount:      Total received in the dividend currency (what the broker shows).
+                       For GBP dividends pass the GBP amount directly.
+    date_str:          Payment or ex-dividend date (YYYY-MM-DD).
+    currency:          Currency of total_amount. Defaults to the position's currency field.
+                       Pass "GBP" explicitly for UK dividends already stated in GBP.
+    strategy:          Required for dual-strategy tickers (FRO, DHT, SBLK, etc.).
+    amount_per_share:  Optional — dividend rate per share (for record-keeping only).
+    shares_at_payment: Share count at time of payment. Required when the position is
+                       closed (shares=0 in frontmatter). Optional for open positions
+                       (defaults to current holding).
+    """
+    cfg = load_config()
+    positions_dir = _get_positions_dir(cfg)
+    vault_root = Path(cfg["vault"]["root"])
+    log_path = vault_root / "_dividend_log.json"
+
+    filepath = resolve_ticker(ticker, positions_dir, strategy)
+    post, meta = load_position(filepath)
+
+    pos_currency = currency or meta.get("currency", "GBP")
+    strategy_name = meta.get("strategy", strategy or "")
+    current_shares = int(meta.get("shares", 0) or 0)
+    shares = shares_at_payment or current_shares
+
+    # Require share count for closed positions so the log entry is complete
+    if current_shares == 0 and shares == 0:
+        raise ValueError(
+            f"{filepath.stem} has shares=0 (position is closed). "
+            "Pass shares_at_payment=<count> to record the holding at time of payment."
+        )
+
+    # GBP dividends need no conversion; all others use live FX
+    if pos_currency == "GBP":
+        total_gbp = round(total_amount, 2)
+    else:
+        fx_rate = _live_fx_rate(pos_currency, cfg)
+        total_gbp = round(total_amount / fx_rate, 2)
+
+    # Load existing log, append new entry, re-sort by date
+    if log_path.exists():
+        with open(log_path) as f:
+            log: list[dict] = json.load(f)
+    else:
+        log = []
+
+    entry: dict = {
+        "date": date_str,
+        "ticker": ticker.upper(),
+        "strategy": strategy_name,
+        "currency": pos_currency,
+        "total_local": round(total_amount, 2),
+        "total_gbp": total_gbp,
+        "shares": shares,
+    }
+    if amount_per_share:
+        entry["amount_per_share"] = round(amount_per_share, 4)
+
+    log.append(entry)
+    log.sort(key=lambda x: x["date"])
+
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+
+    # Increment cumulative GBP total in frontmatter (works for closed positions too)
+    prev = float(meta.get("dividends_received_gbp", 0) or 0)
+    meta["dividends_received_gbp"] = round(prev + total_gbp, 2)
+    save_position(filepath, post)
+
+    per_share_str = f" ({amount_per_share:.4f}/share)" if amount_per_share else ""
+    return (
+        f"Logged dividend: {ticker.upper()} — {pos_currency} {total_amount:.2f}{per_share_str} = £{total_gbp:.2f}\n"
+        f"  {filepath.name}: dividends_received_gbp = £{meta['dividends_received_gbp']:.2f}\n"
+        f"  {log_path.name}: {len(log)} total entr{'y' if len(log) == 1 else 'ies'}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# get_dividend_history
+# ---------------------------------------------------------------------------
+
+def get_dividend_history(
+    ticker: str | None = None,
+    strategy: str | None = None,
+    year: int | None = None,
+) -> str:
+    """
+    Return received dividend payment history from _dividend_log.json.
+    Optionally filter by ticker, strategy name substring, or calendar year.
+    """
+    cfg = load_config()
+    vault_root = Path(cfg["vault"]["root"])
+    log_path = vault_root / "_dividend_log.json"
+
+    if not log_path.exists():
+        return "No dividend log found. Use log_dividend to record received payments."
+
+    with open(log_path) as f:
+        entries: list[dict] = json.load(f)
+
+    if not entries:
+        return "No dividends logged yet."
+
+    # Apply filters
+    if ticker:
+        entries = [e for e in entries if e.get("ticker", "").upper() == ticker.upper()]
+    if strategy:
+        entries = [e for e in entries if strategy.lower() in e.get("strategy", "").lower()]
+    if year:
+        entries = [e for e in entries if e.get("date", "").startswith(str(year))]
+
+    if not entries:
+        active = [f for f in [ticker and f"ticker={ticker}", strategy and f"strategy={strategy}", year and f"year={year}"] if f]
+        return f"No dividend records matching: {', '.join(active)}"
+
+    total_gbp = sum(e.get("total_gbp", 0) for e in entries)
+    count = len(entries)
+
+    lines = [
+        f"Dividend history — {count} payment{'s' if count != 1 else ''}, "
+        f"total: £{total_gbp:,.2f}",
+        "-" * 70,
+        f"{'Date':<12} {'Ticker':<8} {'Strategy':<26} {'Per Share':>12} {'Total (£)':>9}",
+        "-" * 70,
+    ]
+    for e in sorted(entries, key=lambda x: x["date"], reverse=True):
+        per_share = f"{e.get('amount_per_share', 0):.4f} {e.get('currency', '')}"
+        lines.append(
+            f"{e['date']:<12} {e.get('ticker', ''):<8} {e.get('strategy', ''):<26} "
+            f"{per_share:>12} £{e.get('total_gbp', 0):>8,.2f}"
+        )
+    lines.append("-" * 70)
+    lines.append(f"{'Total':<58} £{total_gbp:>8,.2f}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # get_position
 # ---------------------------------------------------------------------------
 
@@ -722,6 +878,143 @@ def update_all_prices(tickers: list[str] | None = None) -> str:
             failed += 1
 
     lines.append(f"\nDone. Updated: {updated}, Failed: {failed}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# update_dividends
+# ---------------------------------------------------------------------------
+
+def update_dividends(tickers: list[str] | None = None) -> str:
+    """
+    Fetch dividend data from EODHD and update active position frontmatter.
+    Equivalent to running Scripts/update_dividends.py.
+
+    Updates per position: div_per_share, div_yield_pct, div_income_gbp, next_ex_div_date.
+    Skips: monitoring positions, exchange=skip, ticker=n/a, shares=0.
+    yfinance fallback for exchanges not covered by EODHD (SGX, Borsa Italiana).
+    """
+    import requests
+    from datetime import timedelta
+
+    cfg = load_config()
+    positions_dir = _get_positions_dir(cfg)
+    api_key = _eodhd_key(cfg)
+    fx_rates = cfg.get("fx_rates", {})
+
+    filter_set = set(tickers) if tickers else None
+
+    today = date.today()
+    one_year_ago = (today - timedelta(days=365)).isoformat()
+    today_str = today.isoformat()
+    ninety_days_str = (today + timedelta(days=90)).isoformat()
+
+    def _fetch_eodhd(symbol: str, from_d: str, to_d: str) -> list[dict]:
+        try:
+            r = requests.get(
+                f"https://eodhd.com/api/div/{symbol}",
+                params={"api_token": api_key, "from": from_d, "to": to_d, "fmt": "json"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _fetch_yf(sym: str, from_d: str, to_d: str) -> list[dict]:
+        try:
+            import yfinance as yf
+            divs = yf.Ticker(sym).dividends
+            if divs is None or divs.empty:
+                return []
+            return [
+                {"date": dt.date().isoformat(), "value": float(v), "currency": ""}
+                for dt, v in divs.items()
+                if from_d <= dt.date().isoformat() <= to_d
+            ]
+        except Exception:
+            return []
+
+    def _extrapolate_next(hist: list[dict]) -> str | None:
+        dated = sorted(hist, key=lambda x: x["date"])
+        if len(dated) < 2:
+            return None
+        try:
+            last = date.fromisoformat(dated[-1]["date"])
+            prev = date.fromisoformat(dated[-2]["date"])
+            nxt = last + (last - prev)
+            return nxt.isoformat() if nxt > today else None
+        except Exception:
+            return None
+
+    updated = skipped = 0
+    lines = [f"Updating dividend data ({today_str}, provider: eodhd)...", "-" * 60]
+
+    for filepath in sorted(positions_dir.glob("*.md")):
+        post = fm.load(filepath)
+        meta = post.metadata
+
+        ticker = meta.get("ticker", "")
+        status = meta.get("status", "")
+        shares = int(meta.get("shares", 0) or 0)
+        exchange = meta.get("exchange", "")
+        currency = meta.get("currency", "GBP")
+        current_price = meta.get("current_price") or 0
+
+        if status != "active" or not shares or ticker == "n/a" or exchange == "skip" or not ticker:
+            skipped += 1
+            continue
+        if filter_set and ticker not in filter_set:
+            continue
+
+        eodhd_sym = build_eodhd_symbol(ticker, exchange)
+        yf_sym = None if eodhd_sym else build_yahoo_symbol(ticker, exchange)
+
+        if not eodhd_sym and not yf_sym:
+            lines.append(f"  {filepath.stem}: SKIP (no symbol for exchange={exchange!r})")
+            skipped += 1
+            continue
+
+        if eodhd_sym:
+            hist = _fetch_eodhd(eodhd_sym, one_year_ago, today_str)
+            upcoming = _fetch_eodhd(eodhd_sym, today_str, ninety_days_str)
+        else:
+            hist = _fetch_yf(yf_sym, one_year_ago, today_str)
+            upcoming = _fetch_yf(yf_sym, today_str, ninety_days_str)
+
+        raw_dps = sum(float(d.get("value", 0)) for d in hist)
+        div_currency = (hist[0].get("currency") or "").upper() if hist else ""
+        div_per_share = raw_dps / 100 if div_currency == "GBX" else raw_dps
+
+        div_yield_pct = (div_per_share / current_price * 100) if current_price else 0.0
+        rate = fx_rates.get(currency, 1.0)
+        div_income_gbp = shares * div_per_share / rate
+
+        next_ex: str | None = None
+        if upcoming:
+            next_ex = sorted(upcoming, key=lambda x: x["date"])[0]["date"]
+        elif hist:
+            next_ex = _extrapolate_next(hist)
+
+        meta["div_per_share"] = round(div_per_share, 4)
+        meta["div_yield_pct"] = round(div_yield_pct, 2)
+        meta["div_income_gbp"] = round(div_income_gbp, 2)
+        if next_ex:
+            meta["next_ex_div_date"] = next_ex
+        elif "next_ex_div_date" in meta:
+            del meta["next_ex_div_date"]
+
+        save_position(filepath, post)
+
+        parts = [f"DPS={div_per_share:.4f}", f"yield={div_yield_pct:.1f}%", f"income=£{div_income_gbp:.0f}"]
+        if next_ex:
+            parts.append(f"ex={next_ex}")
+        lines.append(f"  ✓ {filepath.stem}: {' '.join(parts)}")
+        updated += 1
+
+    lines.append("-" * 60)
+    lines.append(f"Done. Updated: {updated}, Skipped: {skipped}")
     return "\n".join(lines)
 
 

@@ -34,7 +34,7 @@ def load_config() -> dict:
 
     raise FileNotFoundError(
         "No config found. Copy config.example.yaml → config.local.yaml "
-        "and fill in vault path, FMP key, and auth token."
+        "and fill in vault path, EODHD key, and auth token."
     )
 
 

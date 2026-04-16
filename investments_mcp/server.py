@@ -41,9 +41,12 @@ from .trade_ops import (
     open_position as _open_position,
     add_to_position as _add_to_position,
     trim_position as _trim_position,
+    log_dividend as _log_dividend,
+    get_dividend_history as _get_dividend_history,
     get_position as _get_position,
     list_positions as _list_positions,
     update_all_prices as _update_all_prices,
+    update_dividends as _update_dividends,
     get_portfolio_snapshot as _get_portfolio_snapshot,
     check_exits as _check_exits,
 )
@@ -232,6 +235,63 @@ def trim_position(
             date_str=date, notes=notes, strategy=strategy or None,
         )
     except (AmbiguousTicker, PositionNotFound, ValueError) as exc:
+        return _fmt_error(exc)
+
+
+@mcp.tool()
+def log_dividend(
+    ticker: str,
+    total_amount: float,
+    date: str,
+    currency: str = "",
+    strategy: str = "",
+    amount_per_share: float = 0.0,
+    shares_at_payment: int = 0,
+) -> str:
+    """
+    Record a received dividend payment.
+
+    Appends an entry to _dividend_log.json and increments dividends_received_gbp
+    in the position's frontmatter. Works for both active and closed positions.
+
+    ticker:            Position ticker (e.g. "TRMD", "IBT").
+    total_amount:      Total received in the dividend currency — the figure the broker shows.
+    date:              Payment or ex-dividend date (YYYY-MM-DD).
+    currency:          Currency of total_amount. Defaults to the position's currency.
+                       Pass "GBP" for UK dividends already stated in GBP.
+    strategy:          Required for dual-strategy tickers (FRO, DHT, SBLK, LOMA, PAM, 1171, NHC).
+    amount_per_share:  Optional dividend rate per share (for record-keeping).
+    shares_at_payment: Required when position is closed (shares=0). Pass the share count
+                       held at the time of the dividend.
+    """
+    try:
+        return _log_dividend(
+            ticker=ticker,
+            total_amount=total_amount,
+            date_str=date,
+            currency=currency or None,
+            strategy=strategy or None,
+            amount_per_share=amount_per_share,
+            shares_at_payment=shares_at_payment,
+        )
+    except (AmbiguousTicker, PositionNotFound, ValueError) as exc:
+        return _fmt_error(exc)
+
+
+@mcp.tool()
+def get_dividend_history(ticker: str = "", strategy: str = "", year: int = 0) -> str:
+    """
+    Return received dividend payment history from _dividend_log.json.
+    Optionally filter by ticker, strategy (substring match), or calendar year.
+    year: 4-digit integer e.g. 2026. Pass 0 (default) for all years.
+    """
+    try:
+        return _get_dividend_history(
+            ticker=ticker or None,
+            strategy=strategy or None,
+            year=year or None,
+        )
+    except Exception as exc:
         return _fmt_error(exc)
 
 
@@ -430,6 +490,21 @@ def update_all_prices(tickers: str = "") -> str:
     try:
         ticker_list = [t.strip() for t in tickers.split(",") if t.strip()] if tickers else None
         return _update_all_prices(ticker_list)
+    except Exception as exc:
+        return _fmt_error(exc)
+
+
+@mcp.tool()
+def update_dividends(tickers: str = "") -> str:
+    """
+    Fetch dividend data from EODHD and update active position frontmatter.
+    Updates: div_per_share, div_yield_pct, div_income_gbp, next_ex_div_date.
+    tickers: optional comma-separated list to update only specific tickers, e.g. "TRMD,WPM"
+    Equivalent to running Scripts/update_dividends.py.
+    """
+    try:
+        ticker_list = [t.strip() for t in tickers.split(",") if t.strip()] if tickers else None
+        return _update_dividends(ticker_list)
     except Exception as exc:
         return _fmt_error(exc)
 

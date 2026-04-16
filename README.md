@@ -56,23 +56,36 @@ python3 -m investments_mcp.server
 
 ### 4. Register with Claude Code
 
-On the **host machine**:
+**On the host machine** — use stdio transport (no OAuth friction, no port needed):
 ```bash
-claude mcp add investments-vault --transport http http://localhost:8765/mcp
+claude mcp add investments-vault -- python3 -m investments_mcp.server
 ```
 
-From a **remote machine** (replace IP and token):
+**From a remote machine** — SSH port-forward the HTTP endpoint, then register via HTTP:
 ```bash
+# On remote machine: forward localhost:8765 → vault host:8765
+ssh -L 8765:localhost:8765 user@vault-host -N &
+
+# Register (token optional when tunnelled through SSH)
 claude mcp add investments-vault \
   --transport http \
   --header "Authorization: Bearer YOUR_TOKEN" \
-  http://192.168.x.x:8765/mcp
+  http://localhost:8765/mcp
+```
+
+Start the HTTP listener on the vault host:
+```bash
+python3 -m investments_mcp.server --http
 ```
 
 ### 5. Run as a system service (optional)
 
+The systemd service runs in **stdio mode** (Claude Code spawns it on demand).
+For a persistent HTTP listener (remote access), pass `--http` in `ExecStart`:
+
 ```bash
 # Edit investments-mcp.service — update WorkingDirectory and User if needed
+# For HTTP mode: append --http to ExecStart line
 sudo cp investments-mcp.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now investments-mcp
