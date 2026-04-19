@@ -70,11 +70,14 @@ def _coerce_na(value: Any) -> Any:
 
 
 def _normalise_price(price: float | None, currency: str) -> tuple[float, str]:
-    """Convert GBX/GBp prices to GBP. Returns (price, normalised_currency)."""
+    """
+    Return (price, currency_code) with GBp/GBx normalised to the GBX alias.
+    GBX → GBP is handled downstream via the FX table (rate = 100), not here.
+    """
     if price is None:
         raise ValueError("No price returned from provider")
-    if currency in ("GBX", "GBp", "GBx"):
-        return float(price) / 100.0, "GBP"
+    if currency in ("GBp", "GBx"):
+        currency = "GBX"
     return float(price), currency
 
 
@@ -245,7 +248,7 @@ def _infer_currency_from_symbol(symbol: str) -> str:
     suffix = symbol.rsplit(".", 1)[1].upper()
     suffix_to_ccy = {
         "US": "USD",
-        "LSE": "GBX",  # LSE prices are GBX — _normalise_price converts to GBP.
+        "LSE": "GBX",  # default LSE inference; override via currency_hint for GBP-native ETFs.
         "TO": "CAD", "V": "CAD",
         "XETRA": "EUR", "F": "EUR", "PA": "EUR", "AS": "EUR", "LS": "EUR",
         "VI": "EUR", "AT": "EUR", "BR": "EUR", "HE": "EUR", "IR": "EUR",
@@ -347,7 +350,7 @@ def get_all_fx_rates(
     Fetch GBP cross-rates for every supported currency in a single HTTP call
     via EODHD's bulk real-time endpoint. Always includes GBP: 1.0.
     """
-    rates: dict[str, float] = {"GBP": 1.0}
+    rates: dict[str, float] = {"GBP": 1.0, "GBX": 100.0}
     pairs = list(SUPPORTED_CURRENCIES.values())
     client = _get_client(api_key)
     try:

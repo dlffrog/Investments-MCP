@@ -983,9 +983,10 @@ def update_dividends(tickers: list[str] | None = None) -> str:
             hist = _fetch_yf(yf_sym, one_year_ago, today_str)
             upcoming = _fetch_yf(yf_sym, today_str, ninety_days_str)
 
-        raw_dps = sum(float(d.get("value", 0)) for d in hist)
-        div_currency = (hist[0].get("currency") or "").upper() if hist else ""
-        div_per_share = raw_dps / 100 if div_currency == "GBX" else raw_dps
+        # Dividends are denominated in the position's quote currency
+        # (meta['currency']). GBX stays GBX; FX table (rate=100) handles GBP
+        # conversion for div_income_gbp.
+        div_per_share = sum(float(d.get("value", 0)) for d in hist)
 
         div_yield_pct = (div_per_share / current_price * 100) if current_price else 0.0
         rate = fx_rates.get(currency, 1.0)
